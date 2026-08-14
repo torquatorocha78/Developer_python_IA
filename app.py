@@ -1,452 +1,678 @@
 import streamlit as st
-import shlex
-import subprocess
-from pathlib import Path
-from database import (
-    init_db, create_project, list_projects, get_project, update_project_memory,
-    save_file, list_files, get_file, save_message, list_messages,
-    get_file_versions, rollback_file_to_version, get_workspace_path, sync_project_to_disk
+import pandas as pd
+from datetime import datetime
+import database as db
+import utils
+import ai_analyzer
+import report_generator
+
+st.set_page_config(
+    page_title="Gestão de Patentes do IFSC",
+    page_icon="📋",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
-from file_manager import extract_uploaded_files, generate_diff, create_project_zip, build_file_tree
-from ai_engine import ask_gemini, parse_ai_commands
 
-st.set_page_config(page_title="Python AI Agent Developer", page_icon="🤖", layout="wide")
+# Inicializa o banco de dados
+db.init_database()
 
-init_db()
 
-st.title("🤖 Python AI Agent Developer")
-st.caption("Ambiente de desenvolvimento ativo por Agentes IA — Streamlit + Gemini")
-
-# Inicialização dos estados da sessão
-if "project_id" not in st.session_state:
-    st.session_state.project_id = None
-if "selected_file_id" not in st.session_state:
-    st.session_state.selected_file_id = None
-if "last_ai_raw" not in st.session_state:
-    st.session_state.last_ai_raw = None
-if "proposed_changes" not in st.session_state:
-    st.session_state.proposed_changes = []
-if "terminal_output" not in st.session_state:
-    st.session_state.terminal_output = ""
-if "terminal_error" not in st.session_state:
-    st.session_state.terminal_error = ""
-if "last_command" not in st.session_state:
-    st.session_state.last_command = "python "
-
-# Barra Lateral (Projetos e Exportações)
-with st.sidebar:
-    st.header("📁 Projetos")
-
-    with st.form("new_project"):
-        project_name = st.text_input("Nome do novo projeto")
-        project_desc = st.text_area("Descrição", height=80)
-        submitted = st.form_submit_button("Criar projeto", use_container_width=True)
-        if submitted and project_name.strip():
-            pid = create_project(project_name.strip(), project_desc.strip())
-            st.session_state.project_id = pid
-            st.rerun()
-
-    projects = list_projects()
-    if projects:
-        project_labels = {f"{p['name']}  •  #{p['id']}": p["id"] for p in projects}
-        current_pid = st.session_state.project_id
-
-        default_index = 0
-        if current_pid:
-            for i, p in enumerate(projects):
-                if p["id"] == current_pid:
-                    default_index = i
-                    break
-
-        selected_label = st.selectbox("Projeto ativo", list(project_labels.keys()), index=default_index)
-        st.session_state.project_id = project_labels[selected_label]
-
-    st.divider()
-
-    st.header("⚙️ Configurações de IA")
-    model = st.selectbox(
-        "Modelo Gemini",
-        ["gemini-2.5-flash", "gemini-3.5-flash"],
-        index=0,
-        help="Modelos de alta performance para codificação e testes rápidos.",
-    )
-
-    if st.session_state.project_id:
-        st.divider()
-        st.header("📦 Exportar")
-        try:
-            zip_data = create_project_zip(st.session_state.project_id)
-            st.download_button(
-                label="📥 Baixar Projeto corrigido em ZIP",
-                data=zip_data,
-                file_name=f"projeto_{st.session_state.project_id}.zip",
-                mime="application/zip",
-                use_container_width=True
-            )
-        except Exception as e:
-            st.error(f"Erro ao empacotar ZIP: {e}")
-
-if not st.session_state.project_id:
-    st.info("Crie ou selecione um projeto na barra lateral para começar.")
-    st.stop()
-
-# Sincroniza arquivos do banco em disco para as execuções locais
-sync_project_to_disk(st.session_state.project_id)
-
-project = get_project(st.session_state.project_id)
-
-st.subheader(f"Projeto Ativo: {project['name']}")
-if project["description"]:
-    st.caption(project["description"])
-
-# Definição das Abas principais estilo Cursor
-tab_agent, tab_explorer, tab_runner, tab_memory, tab_history = st.tabs([
-    "💻 Agente Workspace",
-    "📂 Explorer (Estilo VS Code)",
-    "🧪 Executar Código & Testes",
-    "🧠 Memória do Projeto",
-    "💬 Histórico Geral"
-])
-
-# Sandboxing de segurança para evitar execução de comandos destrutivos ou maliciosos
-def execute_safe_command(cmd_str):
-    # Lista negra de substrings de comandos perigosos
-    dangerous_keywords = ["rm ", "mv ", "sudo", "chmod", "chown", "dd", "mkfs", "wget", "curl", "bash", "sh", ">", "|"]
-    for word in dangerous_keywords:
-        if word in cmd_str:
-            return False, f"Comando bloqueado por segurança: Contém palavra-chave restrita '{word}'."
-
-    args = shlex.split(cmd_str)
-    if not args:
-        return False, "Comando vazio."
-
-    # Whitelist estrita de comandos executores
-    allowed_executables = {"python", "python3", "pytest", "pip"}
-    executable = Path(args[0]).name
-    if executable not in allowed_executables:
-        return False, f"Apenas execuções começando com {list(allowed_executables)} são permitidas."
-
-    workspace_dir = get_workspace_path(st.session_state.project_id)
+def data_para_input(valor):
+    if valor is None or pd.isna(valor) or valor == "":
+        return None
     try:
-        sync_project_to_disk(st.session_state.project_id)
+        return pd.to_datetime(valor).date()
+    except Exception:
+        return None
 
-        result = subprocess.run(
-            args,
-            cwd=workspace_dir,
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-        output = result.stdout
-        error_output = result.stderr
-        success = result.returncode == 0
-        return success, f"SAÍDA (stdout):\n{output}\n\nERROS / TRACEBACKS (stderr):\n{error_output}"
-    except subprocess.TimeoutExpired:
-        return False, "Erro: Execução excedeu o limite máximo de tempo (Timeout de 30s)."
-    except Exception as e:
-        return False, f"Erro de execução de processo: {str(e)}"
 
-# 1. AGENTE WORKSPACE TAB
-with tab_agent:
-    st.markdown("### 🤖 O que o Agente de Programação deve fazer?")
+def texto(valor):
+    if valor is None or pd.isna(valor):
+        return ""
+    return str(valor)
 
-    # Injetor rápido para envio de tracebacks vindos do terminal
-    default_prompt_val = ""
-    if "quick_fix_traceback" in st.session_state and st.session_state.quick_fix_traceback:
-        default_prompt_val = (
-            f"Ocorreu um erro de execução. Por favor analise o traceback abaixo e corrija o(s) arquivo(s) afetado(s):\n\n"
-            f"```\n{st.session_state.quick_fix_traceback}\n```"
-        )
-        del st.session_state.quick_fix_traceback
+st.markdown("""
+<style>
+    .status-verde { color: #00CC00; font-weight: bold; }
+    .status-amarelo { color: #FFCC00; font-weight: bold; }
+    .status-vermelho { color: #FF0000; font-weight: bold; }
+    .status-pago { color: #0099FF; font-weight: bold; }
+    .title-ifsc { text-align: center; color: #003366; }
+</style>
+""", unsafe_allow_html=True)
 
-    prompt = st.text_area(
-        "Prompt",
-        height=180,
-        value=default_prompt_val,
-        placeholder="Descreva as modificações, erros, novos scripts ou funcionalidades desejadas...",
-        key="main_prompt"
-    )
+# Logo e Título Principal
+st.markdown('<h1 class="title-ifsc">🏛️ Gestão de Patentes do IFSC</h1>', unsafe_allow_html=True)
+st.markdown('<p style="text-align: center; color: #666;">Instituto Federal de Educação, Ciência e Tecnologia de Santa Catarina</p>', unsafe_allow_html=True)
+st.divider()
 
-    col_b1, col_b2, col_b3, col_b4 = st.columns(4)
-    selected_action = None
-    if col_b1.button("🔎 Analisar Código", use_container_width=True):
-        selected_action = "analisar"
-    if col_b2.button("💻 Criar / Alterar Código", use_container_width=True):
-        selected_action = "codigo"
-    if col_b3.button("🐞 Corrigir Erros", use_container_width=True):
-        selected_action = "corrigir"
-    if col_b4.button("🚀 Otimizar", use_container_width=True):
-        selected_action = "melhorar"
+st.sidebar.title("⚙️ Navegação")
+pagina = st.sidebar.radio("Selecione uma página:", 
+    ["📊 Dashboard", "➕ Adicionar Patente", "📁 Minhas Patentes", "📤 Importar Excel", "🤖 Análise IA", "📄 Gerar Relatórios"])
 
-    if selected_action:
-        if not prompt.strip():
-            st.warning("Descreva o seu objetivo no prompt antes de executar.")
-        else:
-            project_files = list_files(st.session_state.project_id)
-            context_parts = []
-            for f in project_files:
-                content = get_file(f["id"])
-                if content:
-                    context_parts.append(f"### ARQUIVO: {f['path']}\n```\n{content['content']}\n```")
-            context = "\n\n".join(context_parts)
+if pagina == "📊 Dashboard":
+    st.title("📊 Dashboard de Patentes")
 
-            # Recupera as diretrizes permanentes de memória do projeto
-            proj_memory = project.get("memory", "")
-            memory_context = f"\nREGRAS E MEMÓRIA PERMANENTE DO PROJETO:\n{proj_memory}\n" if proj_memory else ""
+    df_patentes = db.obter_patentes()
 
-            action_instruction = {
-                "analisar": "Analise o problema, identifique causas e descreva de forma concisa quais arquivos precisam mudar.",
-                "codigo": "Desenvolva a solução completa. Sempre que alterar ou criar um arquivo, insira seu conteúdo integral entre tags: <write_file path=\"caminho/do/arquivo\">CONTEUDO COMPLETO DO ARQUIVO</write_file>.",
-                "corrigir": "Analise o traceback ou bug indicado, explique a correção e aplique-a nos arquivos usando obrigatoriamente a estrutura: <write_file path=\"caminho/do/arquivo\">CONTEUDO INTEGRAL CORRIGIDO</write_file>.",
-                "melhorar": "Refatore e aperfeiçoe o código. Se fizer alterações, entregue os arquivos reestruturados na tag <write_file path=\"caminho/do/arquivo\">CONTEUDO</write_file>."
-            }[selected_action]
-
-            final_prompt = f"""
-Você é um Engenheiro de Software Python Sênior especialista em desenvolvimento rápido de agentes autônomos.
-Seu objetivo é guiar e evoluir o projeto do usuário.
-
-REGRAS CRÍTICAS PARA ALTERAÇÃO DE ARQUIVOS:
-- Sempre que criar, alterar ou corrigir um arquivo, encapsule TODO o conteúdo do arquivo dentro de:
-  <write_file path="nome_do_arquivo_com_caminho_relativo">
-  CONTEÚDO COMPLETO AQUI
-  </write_file>
-- Nunca omita partes de códigos com '...' ou marque como 'restante do código igual'. Escreva o arquivo COMPLETO.
-- Você pode propor modificações em múltiplos arquivos num único turno de resposta.
-
-CONTEXTO DE MEMÓRIA DO PROJETO:
-{memory_context}
-
-PROBLEMA DO USUÁRIO:
-{prompt}
-
-TAREFA:
-{action_instruction}
-
-ARQUIVOS ATUAIS DO PROJETO:
-{context if context else "(nenhum arquivo foi enviado ainda)"}
-
-Responda em português de forma clara e instrutiva.
-"""
-            with st.spinner("O Agente IA está analisando os arquivos e gerando solução..."):
-                try:
-                    raw_answer = ask_gemini(final_prompt, model=model)
-                    save_message(st.session_state.project_id, "user", prompt)
-                    save_message(st.session_state.project_id, "assistant", raw_answer)
-
-                    st.session_state.last_ai_raw = raw_answer
-                    st.session_state.proposed_changes = parse_ai_commands(raw_answer)
-                    st.success("Resposta gerada!")
-                except Exception as e:
-                    st.error(f"Erro ao consultar a IA: {e}")
-
-    # Exibição de resposta do Agente e Bloco de Aprovação de Alterações
-    if st.session_state.last_ai_raw:
-        st.markdown("### 💬 Resposta do Agente")
-        st.markdown(st.session_state.last_ai_raw)
-
-        if st.session_state.proposed_changes:
-            st.divider()
-            st.subheader("🛠️ Modificações Propostas pelo Agente")
-            st.info("Revise com cuidado a diferença (diff) abaixo antes de aplicar as mudanças diretamente no projeto.")
-
-            all_files_by_path = {f["path"]: get_file(f["id"]) for f in list_files(st.session_state.project_id)}
-
-            for change in st.session_state.proposed_changes:
-                filepath = change["path"]
-                new_code = change["content"]
-
-                old_code = ""
-                is_new_file = True
-                if filepath in all_files_by_path:
-                    old_code = all_files_by_path[filepath]["content"]
-                    is_new_file = False
-
-                with st.expander(f"📝 Ver alteração para: `{filepath}`" + (" (Novo Arquivo)" if is_new_file else " (Modificado)"), expanded=True):
-                    if is_new_file:
-                        st.code(new_code, language="python")
-                    else:
-                        diff_text = generate_diff(old_code, new_code, filepath)
-                        st.code(diff_text, language="diff")
-
-                    # Botão para aplicar apenas este arquivo individualmente
-                    col_app_btn, _ = st.columns([1.5, 3.5])
-                    if col_app_btn.button(f"Aplicar mudanças em {filepath}", key=f"apply_ind_{filepath}"):
-                        ext = Path(filepath).suffix.lower()
-                        save_file(st.session_state.project_id, filepath, new_code, ext)
-                        st.success(f"Arquivo `{filepath}` atualizado!")
-                        st.session_state.proposed_changes = [c for c in st.session_state.proposed_changes if c["path"] != filepath]
-                        st.rerun()
-
-            st.markdown("---")
-            if st.button("🚀 Aplicar TODAS as alterações sugeridas", type="primary", use_container_width=True):
-                for change in st.session_state.proposed_changes:
-                    filepath = change["path"]
-                    new_code = change["content"]
-                    ext = Path(filepath).suffix.lower()
-                    save_file(st.session_state.project_id, filepath, new_code, ext)
-
-                st.success("Todos os arquivos foram atualizados! Versões de backup prontas para Rollback.")
-                st.session_state.proposed_changes = []
-                st.rerun()
-
-# 2. EXPLORER (ESTILO VS CODE) TAB
-with tab_explorer:
-    st.markdown("### 📂 Arquivos no Workspace")
-
-    with st.expander("📥 Enviar novos arquivos/zip para o projeto", expanded=False):
-        uploads = st.file_uploader(
-            "Selecione códigos, documentações ou arquivos ZIP",
-            type=["py", "txt", "json", "csv", "xlsx", "xls", "docx", "pdf", "zip", "md", "toml", "yaml", "yml"],
-            accept_multiple_files=True,
-            key="uploader"
-        )
-        if st.button("Salvar Uploads", use_container_width=True):
-            if uploads:
-                count = 0
-                for uploaded in uploads:
-                    extracted = extract_uploaded_files(uploaded)
-                    for item in extracted:
-                        save_file(
-                            st.session_state.project_id,
-                            item["path"],
-                            item["content"],
-                            item["extension"],
-                        )
-                        count += 1
-                st.success(f"{count} arquivo(s) salvos com sucesso!")
-                st.rerun()
-
-    files = list_files(st.session_state.project_id)
-    if not files:
-        st.info("Nenhum arquivo cadastrado. Peça para a IA criar códigos!")
+    if len(df_patentes) == 0:
+        st.info("📭 Nenhuma patente cadastrada ainda. Adicione uma patente para começar!")
     else:
-        tree = build_file_tree(files)
-        col_tree, col_viewer = st.columns([2, 3])
+        total_patentes = len(df_patentes)
+        hoje = datetime.now().date()
 
-        with col_tree:
-            st.markdown("**Árvore de Diretórios (Selecione um arquivo)**")
+        def data_anuidade(valor):
+            try:
+                return pd.to_datetime(valor).date()
+            except Exception:
+                return None
 
-            def render_tree(node, depth=0):
-                for name, value in sorted(node.items()):
-                    if "id" not in value:
-                        # Pasta
-                        with st.expander(f"📁 {' ' * (depth*2)}{name}", expanded=True):
-                            render_tree(value, depth + 1)
+        def dados_prazo_ordinario(anu):
+            if anu['status'] == 'nao_pagar' or anu['data_pagamento']:
+                return None
+
+            inicio_ord = data_anuidade(anu['data_inicio_ordinario'])
+            fim_ord = data_anuidade(anu['data_fim_ordinario'])
+            if not inicio_ord or not fim_ord or not (inicio_ord <= hoje <= fim_ord):
+                return None
+
+            dias_restantes = (fim_ord - hoje).days
+            status = 'amarelo' if dias_restantes <= 30 else 'verde'
+            return status, dias_restantes
+
+        dados_dashboard = []
+
+        for _, patente in df_patentes.iterrows():
+            anuidades = db.obter_anuidades(patente['id'])
+            for _, anu in anuidades.iterrows():
+                prazo = dados_prazo_ordinario(anu)
+                if not prazo:
+                    continue
+
+                status, dias_restantes = prazo
+                emoji = utils.criar_emoji_status(status)
+                dados_dashboard.append({
+                    "ID": patente['id'],
+                    "Processo": patente['numero_patente'],
+                    "Título": patente.get('titulo') or "-",
+                    "Deposito": utils.formatar_data(patente['data_deposito']),
+                    "Status": f"{emoji} {status.upper()}",
+                    "Anuidade": anu['numero_anuidade'],
+                    "Fim Prazo Ordinário": utils.formatar_data(anu['data_fim_ordinario']),
+                    "Dias p/ Vencer": dias_restantes,
+                    "Gestor": patente.get('gestor', 'N/A'),
+                    "Campus": patente.get('campus') or "-"
+                })
+
+        alertas_verde = sum(1 for item in dados_dashboard if '✅' in item["Status"])
+        alertas_amarelo = sum(1 for item in dados_dashboard if '⚠️' in item["Status"])
+
+        col1, col2, col3, col4 = st.columns(4)
+
+        with col1:
+            st.metric("📚 Total de Patentes", total_patentes)
+
+        with col2:
+            st.metric("📅 Em Prazo Ordinário", len(dados_dashboard))
+
+        with col3:
+            st.metric("✅ Normal", alertas_verde, delta="green")
+
+        with col4:
+            st.metric("⚠️ Atenção", alertas_amarelo, delta="orange")
+
+        st.divider()
+
+        st.subheader("Anuidades em Prazo Ordinário")
+
+        df_dashboard = pd.DataFrame(dados_dashboard)
+
+        def colorir_status(row):
+            if '⚠️' in str(row['Status']):
+                return ['background-color: #ffffcc'] * len(row)
+            elif '✅' in str(row['Status']):
+                return ['background-color: #ccffcc'] * len(row)
+            else:
+                return [''] * len(row)
+
+        if df_dashboard.empty:
+            st.info("Nenhuma anuidade está em prazo ordinário neste momento.")
+        else:
+            df_dashboard = df_dashboard.sort_values("Dias p/ Vencer")
+            st.dataframe(
+                df_dashboard.style.apply(colorir_status, axis=1),
+                use_container_width=True,
+                hide_index=True
+            )
+
+elif pagina == "➕ Adicionar Patente":
+    st.title("➕ Adicionar Nova Patente")
+
+    with st.form("form_nova_patente"):
+        tab1, tab2, tab3 = st.tabs(["📌 Informações Básicas", "⚖️ Documentos e Atribuições", "📅 Prazos e Datas"])
+
+        with tab1:
+            col1, col2 = st.columns(2)
+            with col1:
+                id_externo = st.text_input("ID do Sistema (Opcional)", placeholder="Ex: 123")
+                numero_patente = st.text_input("Número do Processo / Patente (Obrigatório)", placeholder="Ex: BR1020220000001")
+                titulo = st.text_input("Título", placeholder="Título da patente")
+                gestor = st.text_input("Gestor", placeholder="Ex: IFSC", value="IFSC")
+            with col2:
+                status_patente = st.selectbox(
+                    "Status do Pedido",
+                    ["Ativo", "Patente Concedida", "Tramitando Normal", "Indeferimento", "Recurso contra indeferimento", "Pedido de exame", "Arquivado", "Desistência"]
+                )
+                titular = st.text_input("Depositante / Titular", placeholder="Ex: IFSC")
+                inventores = st.text_area("Nome dos Inventores", placeholder="Separe os nomes por / ou linha")
+                campus = st.text_input("Campus", placeholder="Ex: Florianópolis")
+
+        with tab2:
+            col3, col4 = st.columns(2)
+            with col3:
+                modalidade_pi = st.text_input("Modalidade de PI", placeholder="Ex: Patente de Invenção")
+                ipc_classificacao = st.text_input("IPC - Classificação", placeholder="Ex: H01L 21/00")
+                acordo_titularidade = st.text_input("Acordo de Titularidade", placeholder="Ex: Sim, Não, Pendente")
+            with col4:
+                procuracao = st.text_input("Procuração", placeholder="Ex: Entregue, Não se aplica")
+                termo_cessao = st.text_input("Termo de Cessão", placeholder="Ex: Assinado")
+                atributos = st.text_area("Atributos Complementares", placeholder="Tags ou observações rápidas")
+
+        with tab3:
+            col5, col6 = st.columns(2)
+            with col5:
+                data_deposito = st.date_input("Data do Depósito (Obrigatório)")
+                ano = st.number_input("Ano do Depósito", min_value=1990, max_value=2100, value=datetime.now().year)
+                data_publicacao = st.date_input("Data da Publicação", value=None)
+            with col6:
+                data_concessao = st.date_input("Data da Concessão", value=None)
+                data_exame = st.date_input("Data do Exame", value=None)
+
+        descricao = st.text_area("Resumo / Descrição da Patente", placeholder="Descreva brevemente o objeto da patente")
+
+        enviar = st.form_submit_button("✅ Cadastrar Patente", use_container_width=True, type="primary")
+
+        if enviar:
+            if not numero_patente or not data_deposito:
+                st.error("❌ Por favor, preencha o campo de Processo (Número da Patente) e a Data do Depósito.")
+            else:
+                data_dep_str = data_deposito.strftime("%Y-%m-%d")
+                data_conc_str = data_concessao.strftime("%Y-%m-%d") if data_concessao else None
+                data_pub_str = data_publicacao.strftime("%Y-%m-%d") if data_publicacao else None
+                data_ex_str = data_exame.strftime("%Y-%m-%d") if data_exame else None
+
+                sucesso, mensagem = db.adicionar_patente(
+                    numero=numero_patente,
+                    data_dep=data_dep_str,
+                    data_conc=data_conc_str,
+                    descricao=descricao,
+                    titular=titular,
+                    gestor=gestor,
+                    status_patente=status_patente,
+                    titulo=titulo,
+                    inventores=inventores,
+                    campus=campus,
+                    atributos=atributos,
+                    id_externo=id_externo,
+                    modalidade_pi=modalidade_pi,
+                    ano=int(ano),
+                    data_publicacao=data_pub_str,
+                    data_exame=data_ex_str,
+                    acordo_titularidade=acordo_titularidade,
+                    procuracao=procuracao,
+                    termo_cessao=termo_cessao,
+                    ipc_classificacao=ipc_classificacao
+                )
+
+                if sucesso:
+                    st.success(f"🎉 {mensagem}")
+                    st.balloons()
+                else:
+                    st.error(f"❌ {mensagem}")
+
+elif pagina == "📁 Minhas Patentes":
+    st.title("📁 Gerenciar Patentes")
+
+    df_patentes = db.obter_patentes()
+
+    if len(df_patentes) == 0:
+        st.info("📭 Nenhuma patente cadastrada. Vá em 'Adicionar Patente' ou 'Importar Excel' para começar.")
+    else:
+        busca = st.text_input("🔍 Filtrar por número, título, inventor, gestor, campus ou classificação:")
+        df_filtrado = df_patentes.copy()
+        if busca:
+            termo = busca.lower()
+            colunas_busca = ["numero_patente", "titulo", "inventores", "gestor", "campus", "ipc_classificacao", "id_externo"]
+            mascara = pd.Series(False, index=df_filtrado.index)
+            for coluna in colunas_busca:
+                if coluna in df_filtrado:
+                    mascara = mascara | df_filtrado[coluna].fillna("").astype(str).str.lower().str.contains(termo, regex=False)
+            df_filtrado = df_filtrado[mascara]
+
+        if len(df_filtrado) == 0:
+            st.warning("Nenhuma patente correspondente aos filtros aplicados.")
+            st.stop()
+
+        opcoes = {
+            f"{row['numero_patente']} - {row.get('titulo') or 'Sem título'}": row['numero_patente']
+            for _, row in df_filtrado.iterrows()
+        }
+        patente_label = st.selectbox("Selecione uma patente para detalhar:", list(opcoes.keys()))
+        patente_selecionada = opcoes[patente_label]
+
+        patente_dados = df_patentes[df_patentes['numero_patente'] == patente_selecionada].iloc[0]
+        patente_id = patente_dados['id']
+
+        # Grid de Exibição das Novas Colunas
+        st.subheader("📋 Detalhes da Patente")
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("🔑 ID", patente_dados.get('id_externo') or "N/A")
+            st.metric("🏛️ Processo", patente_dados['numero_patente'])
+        with col2:
+            st.metric("📅 Data do Depósito", utils.formatar_data(patente_dados['data_deposito']))
+            st.metric("📅 Data da Concessão", utils.formatar_data(patente_dados['data_concessao']) if patente_dados['data_concessao'] else "Pendente")
+        with col3:
+            st.metric("🎯 Status do Pedido", patente_dados.get('status', 'Ativo'))
+            st.metric("🔬 Modalidade de PI", patente_dados.get('modalidade_pi') or "N/A")
+        with col4:
+            st.metric("👤 Depositante / Titular", patente_dados['titular'] if patente_dados['titular'] else "N/A")
+            st.metric("🏷️ IPC Classificação", patente_dados.get('ipc_classificacao') or "N/A")
+
+        st.divider()
+
+        with st.expander("📄 Ver Outros Atributos e Documentos"):
+            col_doc1, col_doc2, col_doc3 = st.columns(3)
+            with col_doc1:
+                st.write(f"🤝 **Acordo de Titularidade:** {patente_dados.get('acordo_titularidade') or '-'}")
+                st.write(f"🏫 **Campus:** {patente_dados.get('campus') or '-'}")
+            with col_doc2:
+                st.write(f"🛡️ **Procuração:** {patente_dados.get('procuracao') or '-'}")
+                st.write(f"📅 **Data Exame:** {utils.formatar_data(patente_dados.get('data_exame'))}")
+            with col_doc3:
+                st.write(f"📝 **Termo de Cessão:** {patente_dados.get('termo_cessao') or '-'}")
+                st.write(f"📅 **Data Publicação:** {utils.formatar_data(patente_dados.get('data_publicacao'))}")
+
+        if patente_dados.get('descricao'):
+            st.info(f"**Resumo / Descrição:**\n{patente_dados['descricao']}")
+
+        st.divider()
+
+        # Formulário de Edição
+        with st.expander("✏️ Editar dados desta patente"):
+            with st.form(f"form_editar_{patente_id}"):
+                tab_edit1, tab_edit2, tab_edit3 = st.tabs(["📌 Básicos", "⚖️ Documentação", "📅 Datas"])
+
+                with tab_edit1:
+                    col_e1, col_e2 = st.columns(2)
+                    with col_e1:
+                        edit_id_externo = st.text_input("ID Externo", value=texto(patente_dados.get('id_externo')))
+                        edit_numero = st.text_input("Número do Processo / Patente", value=texto(patente_dados.get('numero_patente')))
+                        edit_titulo = st.text_input("Título", value=texto(patente_dados.get('titulo')))
+                        edit_gestor = st.text_input("Gestor", value=texto(patente_dados.get('gestor')))
+                    with col_e2:
+                        edit_titular = st.text_area("Depositante / Titular", value=texto(patente_dados.get('titular')), height=90)
+                        edit_inventores = st.text_area("Nome dos Inventores", value=texto(patente_dados.get('inventores')), height=90)
+                        edit_status = st.text_input("Status do Pedido", value=texto(patente_dados.get('status')))
+                        edit_campus = st.text_input("Campus", value=texto(patente_dados.get('campus')))
+
+                with tab_edit2:
+                    col_e3, col_e4 = st.columns(2)
+                    with col_e3:
+                        edit_modalidade = st.text_input("Modalidade de PI", value=texto(patente_dados.get('modalidade_pi')))
+                        edit_ipc = st.text_input("IPC Classificação", value=texto(patente_dados.get('ipc_classificacao')))
+                        edit_acordo = st.text_input("Acordo de Titularidade", value=texto(patente_dados.get('acordo_titularidade')))
+                    with col_e4:
+                        edit_procuracao = st.text_input("Procuração", value=texto(patente_dados.get('procuracao')))
+                        edit_cessao = st.text_input("Termo de Cessão", value=texto(patente_dados.get('termo_cessao')))
+                        edit_atributos = st.text_area("Atributos", value=texto(patente_dados.get('atributos')), height=90)
+
+                with tab_edit3:
+                    col_e5, col_e6 = st.columns(2)
+                    with col_e5:
+                        edit_data_dep = st.date_input("Data do Depósito", value=data_para_input(patente_dados.get('data_deposito')))
+                        edit_ano = st.number_input("Ano", value=int(patente_dados.get('ano')) if patente_dados.get('ano') else datetime.now().year)
+                        edit_data_pub = st.date_input("Data de Publicação", value=data_para_input(patente_dados.get('data_publicacao')))
+                    with col_e6:
+                        edit_data_conc = st.date_input("Data de Concessão", value=data_para_input(patente_dados.get('data_concessao')))
+                        edit_data_exame = st.date_input("Data do Exame", value=data_para_input(patente_dados.get('data_exame')))
+
+                edit_descricao = st.text_area("Resumo/Descrição", value=texto(patente_dados.get('descricao')), height=130)
+
+                salvar = st.form_submit_button("💾 Salvar Alterações", use_container_width=True, type="primary")
+
+                if salvar:
+                    if not edit_numero or not edit_data_dep:
+                        st.error("Preencha pelo menos o número do processo e a data do depósito.")
                     else:
-                        # Arquivo
-                        file_id = value["id"]
-                        icon = "📄"
-                        if value["extension"] == ".py":
-                            icon = "🐍"
-                        elif value["extension"] in [".json", ".yaml", ".toml"]:
-                            icon = "⚙️"
-                        elif value["extension"] == ".md":
-                            icon = "📝"
+                        ok, msg = db.atualizar_patente(
+                            patente_id=patente_id,
+                            numero=edit_numero,
+                            data_dep=edit_data_dep.strftime("%Y-%m-%d") if edit_data_dep else None,
+                            data_conc=edit_data_conc.strftime("%Y-%m-%d") if edit_data_conc else None,
+                            descricao=edit_descricao,
+                            titular=edit_titular,
+                            gestor=edit_gestor,
+                            status_patente=edit_status,
+                            titulo=edit_titulo,
+                            inventores=edit_inventores,
+                            campus=edit_campus,
+                            atributos=edit_atributos,
+                            id_externo=edit_id_externo,
+                            modalidade_pi=edit_modalidade,
+                            ano=int(edit_ano) if edit_ano else None,
+                            data_publicacao=edit_data_pub.strftime("%Y-%m-%d") if edit_data_pub else None,
+                            data_exame=edit_data_exame.strftime("%Y-%m-%d") if edit_data_exame else None,
+                            acordo_titularidade=edit_acordo,
+                            procuracao=edit_procuracao,
+                            termo_cessao=edit_cessao,
+                            ipc_classificacao=edit_ipc
+                        )
+                        if ok:
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
 
-                        if st.button(f"{icon} {name}", key=f"tree_f_{file_id}", use_container_width=True):
-                            st.session_state.selected_file_id = file_id
+        st.divider()
 
-            render_tree(tree)
+        st.subheader("📊 Detalhamento de Anuidades")
 
-        with col_viewer:
-            if st.session_state.selected_file_id:
-                selected = get_file(st.session_state.selected_file_id)
-                if selected:
-                    st.markdown(f"#### Editando: `{selected['path']}`")
+        anuidades = db.obter_anuidades(patente_id)
 
-                    edited_code = st.text_area(
-                        "Visualização de Código",
-                        value=selected["content"],
-                        height=400,
-                        key=f"editor_{selected['id']}"
+        if anuidades.empty:
+            st.warning("Nenhuma anuidade encontrada para esta patente. Verifique a data de depósito cadastrada.")
+        else:
+            dados_tabela = []
+            for _, anu in anuidades.iterrows():
+                if anu['status'] == 'nao_pagar':
+                    emoji = '⛔'
+                    status_display = 'NÃO PAGAR'
+                    dias_restantes = '-'
+                else:
+                    status = utils.calcular_status_anuidade(
+                        anu['data_inicio_ordinario'],
+                        anu['data_fim_ordinario'],
+                        anu['data_inicio_extraordinario'],
+                        anu['data_fim_extraordinario'],
+                        anu['data_pagamento']
                     )
 
-                    c_ed1, c_ed2 = st.columns(2)
-                    if c_ed1.button("Salvar alterações manuais", use_container_width=True, type="primary"):
-                        save_file(
-                            st.session_state.project_id,
-                            selected["path"],
-                            edited_code,
-                            selected["extension"]
-                        )
-                        st.success("Arquivo atualizado e nova versão salva no histórico!")
-                        st.rerun()
+                    dias_restantes = utils.obter_dias_restantes(
+                        anu['data_fim_ordinario'],
+                        anu['data_pagamento']
+                    )
 
-                    # Lista de Versões e Reversão (Rollback)
-                    st.markdown("##### 📜 Histórico de Versões")
-                    versions = get_file_versions(selected["id"])
-                    if not versions:
-                        st.caption("Apenas a versão original registrada.")
-                    else:
-                        for v in versions:
-                            col_v1, col_v2 = st.columns([3, 1])
-                            col_v1.caption(f"Versão #{v['version']} - Modificada em {v['created_at']}")
-                            if col_v2.button("Restaurar", key=f"roll_{v['id']}"):
-                                if rollback_file_to_version(selected["id"], v["id"]):
-                                    st.success(f"Restaurado para a versão #{v['version']}!")
-                                    st.rerun()
+                    emoji = utils.criar_emoji_status(status)
+                    status_display = status.upper()
 
-# 3. TERMINAL AND CODE RUNNER TAB (Execução e capturas)
-with tab_runner:
-    st.markdown("### 🧪 Terminal do Workspace")
-    st.caption("Rode scripts locais e testes unitários com segurança do Sandbox. Ex: `python main.py` ou `pytest`")
+                dados_tabela.append({
+                    "Anuidade": anu['numero_anuidade'],
+                    "Inicio Ordinario": utils.formatar_data(anu['data_inicio_ordinario']),
+                    "Fim Ordinario": utils.formatar_data(anu['data_fim_ordinario']),
+                    "Dias Restantes": dias_restantes if dias_restantes != '-' else ("Pago" if anu['data_pagamento'] else '-'),
+                    "Status": f"{emoji} {status_display}",
+                    "Data Pagamento": utils.formatar_data(anu['data_pagamento']) if anu['data_pagamento'] else "-"
+                })
 
-    cmd_input = st.text_input(
-        "Executar comando no terminal",
-        value=st.session_state.last_command,
-        placeholder="python script.py"
-    )
-    st.session_state.last_command = cmd_input
+            df_tabela = pd.DataFrame(dados_tabela)
 
-    if st.button("⚡ Executar comando", use_container_width=True, type="primary"):
-        with st.spinner("Executando processo..."):
-            success, output = execute_safe_command(cmd_input)
-            st.session_state.terminal_output = output
-            if not success:
-                st.session_state.terminal_error = output
-            else:
-                st.session_state.terminal_error = ""
+            def colorir_linhas(row):
+                if '⛔' in str(row['Status']):
+                    return ['background-color: #e6e6e6'] * len(row)
+                elif '❌' in str(row['Status']):
+                    return ['background-color: #ffcccc'] * len(row)
+                elif '⚠️' in str(row['Status']):
+                    return ['background-color: #ffffcc'] * len(row)
+                elif '✅' in str(row['Status']):
+                    return ['background-color: #ccffcc'] * len(row)
+                elif '💰' in str(row['Status']):
+                    return ['background-color: #ccddff'] * len(row)
+                else:
+                    return [''] * len(row)
 
-    if st.session_state.terminal_output:
-        st.markdown("**Resultado da Execução:**")
-        st.code(st.session_state.terminal_output, language="bash")
+            st.dataframe(
+                df_tabela.style.apply(colorir_linhas, axis=1),
+                use_container_width=True,
+                hide_index=True
+            )
 
-        # Se houver erro ou traceback, exibe atalho de autocorreção
-        if "Traceback" in st.session_state.terminal_output or "Error" in st.session_state.terminal_output or st.session_state.terminal_error:
-            st.error("⚠️ Detectamos erros na execução do código do projeto!")
+            st.divider()
 
-            if st.button("🤖 Enviar erro detectado para Correção do Agente", type="primary", use_container_width=True):
-                st.session_state.quick_fix_traceback = st.session_state.terminal_output
-                st.info("Traceback de erro copiado! Abra a aba 'Agente Workspace' para iniciar a correção automática.")
+            st.subheader("💰 Registrar Pagamento / Marcar Anuidade")
+
+            col1, col2, col3, col4 = st.columns(4)
+
+            with col1:
+                num_anuidade = st.selectbox(
+                    "Selecione a anuidade",
+                    anuidades['numero_anuidade'].tolist(),
+                    key="select_anuidade"
+                )
+
+            with col2:
+                data_pagamento_input = st.date_input(
+                    "Data do Pagamento",
+                    key="data_pag"
+                )
+
+            with col3:
+                if st.button("✅ Registrar Pagamento", use_container_width=True):
+                    db.atualizar_status_anuidade(
+                        patente_id,
+                        num_anuidade,
+                        "pago",
+                        data_pagamento_input.strftime("%Y-%m-%d")
+                    )
+                    st.success("✅ Pagamento registrado com sucesso!")
+                    st.rerun()
+
+            with col4:
+                if st.button("🚫 Marcar Não Pagar", use_container_width=True):
+                    db.atualizar_status_anuidade(
+                        patente_id,
+                        num_anuidade,
+                        "nao_pagar"
+                    )
+                    st.success("✅ Anuidade marcada como não pagar!")
+                    st.rerun()
+
+        st.divider()
+
+        if st.button("🗑️ Deletar Patente", use_container_width=True, type="secondary"):
+            if st.checkbox("Tenho certeza que desejo deletar esta patente definitivamente?"):
+                db.deletar_patente(patente_id)
+                st.success("✅ Patente deletada com sucesso!")
                 st.rerun()
 
-# 4. PERMANENT MEMORY TAB (Configurações persistentes)
-with tab_memory:
-    st.markdown("### 🧠 Memória Permanente do Projeto")
-    st.write(
-        "Forneça diretrizes técnicas de arquitetura que a IA sempre lembrará de seguir ao criar soluções."
+elif pagina == "📤 Importar Excel":
+    st.title("📤 Importar Patentes do Excel")
+
+    st.info("""
+    📋 O sistema aceita a importação automática das colunas da sua planilha original:
+    - **ID** (Identificador do sistema)
+    - **Status do Pedido** (Normalizado para Ativo, Patente Concedida, etc.)
+    - **Processo** (Mapeado automaticamente para o Número da Patente)
+    - **Modalidade de PI**
+    - **Data da concessão**
+    - **Depósito** (Formato: DD/MM/YYYY ou YYYY-MM-DD)
+    - **Ano**
+    - **Datada Publicação**
+    - **Data Exame**
+    - **ACORDO DE TITULARIDADE**
+    - **PROCURAÇÃO**
+    - **TERMO DE CESSÃO**
+    - **GESTOR**
+    - **Depositante/ Titular**
+    - **Título**
+    - **NOME DOS INVENTORES**
+    - **Resumo** (Armazenado na descrição do sistema)
+    - **IPC- CLASSIFICAÇÃO**
+    """)
+
+    arquivo_excel = st.file_uploader(
+        "Selecione um arquivo Excel (.xlsx)",
+        type="xlsx"
     )
 
-    current_memory = project.get("memory", "")
-    new_memory = st.text_area(
-        "Instruções e Memória de Contexto",
-        value=current_memory,
-        height=300,
-        placeholder="Exemplo:\n- Sempre escreva testes unitários utilizando pytest.\n- Utilize sempre o banco de dados SQLite local.\n- Prefira funções puras e de responsabilidade única."
-    )
+    if arquivo_excel:
+        st.subheader("🔎 Análise Preliminar da Planilha")
+        problemas = db.analisar_inconsistencias_excel(arquivo_excel)
 
-    if st.button("Gravar Memória", use_container_width=True):
-        update_project_memory(st.session_state.project_id, new_memory)
-        st.success("Memória do projeto gravada e integrada no motor de prompts!")
-        st.rerun()
+        if problemas:
+            for problema in problemas:
+                st.warning(problema)
+        else:
+            st.success("✅ Estrutura da planilha verificada com sucesso!")
 
-# 5. GENERAL MESSAGES HISTORY TAB
-with tab_history:
-    st.markdown("### 💬 Histórico de Conversas")
-    messages = list_messages(st.session_state.project_id)
-    if not messages:
-        st.info("Nenhuma interação registrada neste projeto ainda.")
+        arquivo_excel.seek(0)
+
+        if st.button("📥 Importar Dados", use_container_width=True, type="primary"):
+            with st.spinner("Efetuando importação em lote de alta performance..."):
+                resultados = db.importar_excel(arquivo_excel)
+
+            st.subheader("📊 Relatório de Importação")
+
+            sucesso_count = sum(1 for _, sucesso, _ in resultados if sucesso)
+            erro_count = len(resultados) - sucesso_count
+
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("✅ Importadas com Sucesso", sucesso_count)
+            with col2:
+                st.metric("❌ Inconsistências / Erros", erro_count)
+
+            dados_resultados = []
+            for patente, sucesso, mensagem in resultados:
+                dados_resultados.append({
+                    "Identificador / Processo": patente,
+                    "Status": "✅ Sucesso" if sucesso else "❌ Erro",
+                    "Ação / Mensagem": mensagem
+                })
+
+            df_resultados = pd.DataFrame(dados_resultados)
+            st.dataframe(df_resultados, use_container_width=True, hide_index=True)
+
+            if sucesso_count > 0:
+                st.success(f"🎉 {sucesso_count} patente(s) importada(s)/atualizada(s) no sistema!")
+                st.balloons()
+
+elif pagina == "🤖 Análise IA":
+    st.title("🤖 Análise Inteligente de Patentes")
+    st.markdown("""Utilize a IA para fazer perguntas e análises sobre suas patentes.""")
+
+    df_patentes = db.obter_patentes()
+
+    if len(df_patentes) == 0:
+        st.warning("⚠️ Nenhuma patente cadastrada. Primeiro, adicione algumas patentes.")
     else:
-        for msg in messages:
-            with st.chat_message("user" if msg["role"] == "user" else "assistant"):
-                st.markdown(msg["content"])
+        st.divider()
+
+        col1, col2 = st.columns([3, 1])
+
+        with col1:
+            pergunta = st.text_input(
+                "Faça uma pergunta sobre suas patentes:",
+                placeholder="Ex: Quantas patentes foram concedidas? Quais estão vencidas? Qual é o status das patentes do IFSC?"
+            )
+
+        with col2:
+            analizar = st.button("🔍 Analisar", use_container_width=True)
+
+        if analizar and pergunta:
+            with st.spinner("Analisando dados..."):
+                resposta = ai_analyzer.analisar_pergunta(df_patentes, pergunta)
+                st.markdown("### 📋 Resposta:")
+                st.info(resposta)
+
+        st.divider()
+
+        st.subheader("📊 Análises Rápidas")
+
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            if st.button("📈 Estatísticas Gerais", use_container_width=True):
+                stats = ai_analyzer.gerar_estatisticas(df_patentes)
+                st.markdown(stats)
+
+        with col2:
+            if st.button("🎯 Patentes por Gestor", use_container_width=True):
+                gestores = ai_analyzer.patentes_por_gestor(df_patentes)
+                st.markdown(gestores)
+
+        with col3:
+            if st.button("⚠️ Alertas Urgentes", use_container_width=True):
+                alertas = ai_analyzer.gerar_alertas(df_patentes)
+                st.markdown(alertas)
+
+elif pagina == "📄 Gerar Relatórios":
+    st.title("📄 Geração de Relatórios em PDF")
+
+    df_patentes = db.obter_patentes()
+
+    if len(df_patentes) == 0:
+        st.warning("⚠️ Nenhuma patente cadastrada. Primeiro, adicione algumas patentes.")
+    else:
+        st.subheader("Escolha o tipo de relatório:")
+
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            if st.button("📋 Relatório Completo", use_container_width=True):
+                with st.spinner("Gerando relatório completo..."):
+                    pdf = report_generator.gerar_relatorio_completo(df_patentes)
+                    st.download_button(
+                        "📥 Baixar Relatório Completo",
+                        data=pdf,
+                        file_name="relatorio_completo.pdf",
+                        mime="application/pdf"
+                    )
+
+        with col2:
+            if st.button("📊 Relatório de Anuidades", use_container_width=True):
+                with st.spinner("Gerando relatório de anuidades..."):
+                    pdf = report_generator.gerar_relatorio_anuidades(df_patentes)
+                    st.download_button(
+                        "📥 Baixar Relatório Anuidades",
+                        data=pdf,
+                        file_name="relatorio_anuidades.pdf",
+                        mime="application/pdf"
+                    )
+
+        with col3:
+            if st.button("⚠️ Relatório de Alertas", use_container_width=True):
+                with st.spinner("Gerando relatório de alertas..."):
+                    pdf = report_generator.gerar_relatorio_alertas(df_patentes)
+                    st.download_button(
+                        "📥 Baixar Relatório Alertas",
+                        data=pdf,
+                        file_name="relatorio_alertas.pdf",
+                        mime="application/pdf"
+                    )
+
+        st.divider()
+
+        st.subheader("📊 Exportação de Dados")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            if st.button("📥 Exportar para Excel", use_container_width=True):
+                excel_buffer = report_generator.exportar_para_excel(df_patentes)
+                st.download_button(
+                    "📥 Baixar Excel",
+                    data=excel_buffer,
+                    file_name="patentes_export.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+
+        with col2:
+            if st.button("📤 Exportar para CSV", use_container_width=True):
+                csv_buffer = report_generator.exportar_para_csv(df_patentes)
+                st.download_button(
+                    "📥 Baixar CSV",
+                    data=csv_buffer,
+                    file_name="patentes_export.csv",
+                    mime="text/csv"
+                )
